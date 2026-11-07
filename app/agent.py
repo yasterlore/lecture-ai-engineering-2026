@@ -16,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -32,6 +32,7 @@ INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
 - 用語や講座に固有のことを答える前に、必ず search_glossary で用語集を確認する。
 - 回の内容を聞かれたら get_lecture_summary を使う。
+- 確認問題や復習クイズを求められたら make_quiz を使う。
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
@@ -43,6 +44,21 @@ agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+agent.tool_plain(tools.make_quiz)
+# 第3回宿題：承認付き学習ログ保存専用エージェント
+save_agent = Agent(
+    instructions=(
+        "あなたは学習ログ保存専用エージェントです。"
+        "利用者が保存を依頼したら、topicとnoteを整理し、"
+        "save_learning_logを呼び出してください。"
+        "保存の最終承認はPython側で行います。"
+    ),
+    output_type=[str, DeferredToolRequests],
+)
+save_agent.tool_plain(
+    tools.save_learning_log,
+    requires_approval=True,
+)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -115,9 +131,17 @@ def main() -> None:
     parser.add_argument("--trace", action="store_true", help="ツール呼び出しを表示する")
     parser.add_argument("--mcp", action="store_true", help="第5回: ツールを MCP サーバー（app/mcp_servers.json）から受け取る")
     parser.add_argument("--list-tools", action="store_true", help="モデルに見えるツール一覧を表示して終了する（APIキー不要）")
+    parser.add_argument("--save-log", action="store_true", help="承認付き学習ログ保存モード")
     args = parser.parse_args()
 
-    target = build_mcp_agent() if args.mcp else agent
+    if args.save_log and args.mcp:
+        parser.error("--save-log と --mcp は同時に使えません")
+
+    target = (
+        save_agent if args.save_log
+        else build_mcp_agent() if args.mcp
+        else agent
+    )
     if args.list_tools:
         print_tools(target)
         return
@@ -132,6 +156,57 @@ def main() -> None:
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
+    if args.save_log:
+        if not isinstance(result.output, DeferredToolRequests):
+            print("[確認] 保存ツールは呼ばれませんでした。")
+            print(result.output)
+            if args.trace:
+                print_trace(result)
+            return
+
+        pending = result.output
+
+        if pending.calls:
+            print("未対応の外部ツールがあるため停止します。")
+            return
+
+        decisions = DeferredToolResults()
+
+        for call in pending.approvals:
+            if call.tool_name != "save_learning_log":
+                decisions.approvals[call.tool_call_id] = False
+                continue
+
+            print("\n--- 学習ログの保存確認 ---")
+            print(
+                json.dumps(
+                    call.args_as_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+            try:
+                answer = input(
+                    "保存を許可しますか？ [yes/NO]: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+
+            decisions.approvals[call.tool_call_id] = (
+                answer in ("yes", "y", "はい")
+            )
+
+        result = target.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=decisions,
+            model=build_model(),
+        )
+
+        if isinstance(result.output, DeferredToolRequests):
+            print("再度承認が必要なため、安全のため停止します。")
+            return
+
     print(result.output)
     if args.trace:
         print_trace(result)
